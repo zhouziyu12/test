@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>四面幕布 - 手势交互</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: system-ui, sans-serif; }
+  canvas { display: block; position: fixed; top: 0; left: 0; }
+  #loading { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #fff; z-index: 10; pointer-events: none; transition: opacity 0.5s; }
+  #loading.done { opacity: 0; }
+  #loading .spinner { width: 48px; height: 48px; border: 3px solid rgba(255,255,255,0.2); border-top-color: #fff; border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 16px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #loading .msg { font-size: 14px; color: rgba(255,255,255,0.7); margin-top: 8px; text-align: center; max-width: 80vw; }
+  #hint { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); color: rgba(255,255,255,0.5); font-size: 14px; z-index: 5; pointer-events: none; transition: opacity 0.8s; }
+  #status { position: fixed; top: 16px; right: 16px; color: rgba(255,255,255,0.35); font-size: 12px; z-index: 5; pointer-events: none; text-align: right; line-height: 1.5; }
+</style>
+</head>
+<body>
+<div id="loading"><div class="spinner"></div><div class="msg">正在加载…</div></div>
+<div id="hint" style="opacity:0">捏合手指 或 鼠标拖拽四块幕布</div>
+<div id="status"></div>
+<video id="video" autoplay playsinline style="display:none;"></video>
+
+<script>
+var statusEl = document.getElementById('status');
+var loadingEl = document.getElementById('loading');
+var hintEl = document.getElementById('hint');
+var video = document.getElementById('video');
+function setStatus(s) { statusEl.textContent = s; loadingEl.querySelector('.msg').textContent = s; }
+
+function loadScript(url, timeout) {
+  return new Promise(function(resolve, reject) {
+    var s = document.createElement('script'); s.src = url;
+    s.onload = function() { resolve(true); };
+    s.onerror = function() { reject(new Error(url)); };
+    document.head.appendChild(s);
+    if (timeout) setTimeout(function() { reject(new Error('timeout: ' + url)); }, timeout);
+  });
+}
+
+var THREE_CDNS = [
+  'https://unpkg.com/three@0.157.0/build/three.min.js',
+  'https://cdn.jsdelivr.net/npm/three@0.157.0/build/three.min.js',
+  'https://registry.npmmirror.com/three/0.157.0/files/build/three.min.js'
+];
+var HANDS_CDNS = [
+  'https://unpkg.com/@mediapipe/hands@0.4.1675469240/hands.js',
+  'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js'
+];
+var HANDS_BASE_URLS = [
+  'https://unpkg.com/@mediapipe/hands@0.4.1675469240/',
+  'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/'
+];
+var handsBaseUrl = HANDS_BASE_URLS[0];
+
+// ── Camera ──
+function initCamera() {
+  return new Promise(function(resolve) {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { resolve(false); return; }
+    var tid = setTimeout(function() { resolve(false); }, 6000);
+    navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1920 }, height: { ideal: 1080 }, facingMode: 'user' }
+    }).then(function(stream) {
+      clearTimeout(tid); video.srcObject = stream;
+      video.onloadedmetadata = function() { video.play().then(function() { resolve(true); }).catch(function() { resolve(false); }); };
+    }).catch(function() { clearTimeout(tid); resolve(false); });
+  });
+}
+
+// ── Fallback texture ──
+function makeFallbackTex() {
+  var c = document.createElement('canvas'); c.width = 640; c.height = 480;
+  var ctx = c.getContext('2d');
+  ctx.fillStyle = '#1a1a2e'; ctx.fillRect(0, 0, 640, 480);
+  for (var i = 0; i < 200; i++) {
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.03 + Math.random() * 0.06) + ')';
+    ctx.beginPath(); ctx.arc(Math.random() * 640, Math.random() * 480, Math.random() * 25 + 3, 0, Math.PI * 2); ctx.fill();
+  }
+  var t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  t.minFilter = THREE.LinearFilter; t.magFilter = THREE.LinearFilter; return t;
+}
+
+// ── Load animal images (4 different ones) ──
+function loadOneAnimal(url) {
+  return new Promise(function(resolve) {
+    var img = new Image(); img.crossOrigin = 'anonymous';
+    var tid = setTimeout(function() { resolve(null); }, 6000);
+    img.onload = function() {
+      clearTimeout(tid);
+      var c = document.createElement('canvas'); c.width = 256; c.height = 256;
+      var ctx = c.getContext('2d');
+      ctx.fillStyle = '#FFF8E1'; ctx.fillRect(0, 0, 256, 256);
+      var s = Math.min(img.width, img.height);
+      var sx = (img.width - s) / 2, sy = (img.height - s) / 2;
+      ctx.drawImage(img, sx, sy, s, s, 0, 0, 256, 256);
+      var t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+      t.minFilter = THREE.LinearFilter; t.magFilter = THREE.LinearFilter; resolve(t);
+    };
+    img.onerror = function() { clearTimeout(tid); resolve(null); };
+    img.src = url;
+  });
+}
+
+function loadAnimalImages() {
+  var sources = [
+    'https://cataas.com/cat?width=300&height=300&t=' + Date.now(),
+    'https://cataas.com/cat?width=300&height=300&t=' + (Date.now() + 1000),
+    'https://cataas.com/cat?width=300&height=300&t=' + (Date.now() + 2000),
+    'https://cataas.com/cat?width=300&height=300&t=' + (Date.now() + 3000)
+  ];
+  return Promise.all([
+    loadOneAnimal(sources[0]), loadOneAnimal(sources[1]),
+    loadOneAnimal(sources[2]), loadOneAnimal(sources[3])
+  ]);
+}
+
+// ── Cloth Simulation ──
+function ClothSimulation(width, height, segX, segY) {
+  this.width = width; this.height = height; this.segX = segX; this.segY = segY;
+  this.particles = []; this.constraints = [];
+  this.grabbedIndices = {}; this.grabTarget = null;
+  var dx = width / segX, dy = height / segY;
+  for (var row = 0; row <= segY; row++) {
+    this.particles[row] = [];
+    for (var col = 0; col <= segX; col++) {
+      var px = -width / 2 + col * dx, py = height / 2 - row * dy, pz = 0;
+      this.particles[row][col] = { pos: new THREE.Vector3(px, py, pz), prev: new THREE.Vector3(px, py, pz), pinned: row === 0 };
+    }
+  }
+  for (var row = 0; row <= segY; row++) {
+    for (var col = 0; col <= segX; col++) {
+      if (col < segX) this.constraints.push({ r1: row, c1: col, r2: row, c2: col + 1, rest: dx, stiff: 0.08 });
+      if (row < segY) this.constraints.push({ r1: row, c1: col, r2: row + 1, c2: col, rest: dy, stiff: 0.15 });
+    }
+  }
+  var diag = Math.sqrt(dx * dx + dy * dy);
+  for (var row = 0; row < segY; row++) {
+    for (var col = 0; col < segX; col++) {
+      this.constraints.push({ r1: row, c1: col, r2: row + 1, c2: col + 1, rest: diag, stiff: 0.05 });
+      this.constraints.push({ r1: row, c1: col + 1, r2: row + 1, c2: col, rest: diag, stiff: 0.05 });
+    }
+  }
+  for (var row = 0; row <= segY; row++)
+    for (var col = 0; col <= segX - 2; col++) this.constraints.push({ r1: row, c1: col, r2: row, c2: col + 2, rest: 2 * dx, stiff: 0.012 });
+  for (var row = 0; row <= segY - 2; row++)
+    for (var col = 0; col <= segX; col++) this.constraints.push({ r1: row, c1: col, r2: row + 2, c2: col, rest: 2 * dy, stiff: 0.012 });
+}
+ClothSimulation.prototype.update = function(dt) {
+  var dtSq = dt * dt, gravity = 0.025, damping = 0.97, segX = this.segX, segY = this.segY, grabbed = this.grabbedIndices;
+  for (var row = 0; row <= segY; row++) {
+    for (var col = 0; col <= segX; col++) {
+      var p = this.particles[row][col];
+      if (p.pinned || grabbed[row * (segX + 1) + col]) continue;
+      var vx = (p.pos.x - p.prev.x) * damping, vy = (p.pos.y - p.prev.y) * damping, vz = (p.pos.z - p.prev.z) * damping;
+      p.prev.set(p.pos.x, p.pos.y, p.pos.z);
+      p.pos.x += vx; p.pos.y += vy - gravity * dtSq; p.pos.z += vz;
+    }
+  }
+  for (var iter = 0; iter < 6; iter++) {
+    for (var i = 0; i < this.constraints.length; i++) {
+      var c = this.constraints[i], p1 = this.particles[c.r1][c.c1], p2 = this.particles[c.r2][c.c2];
+      var cdx = p2.pos.x - p1.pos.x, cdy = p2.pos.y - p1.pos.y, cdz = p2.pos.z - p1.pos.z;
+      var dist = Math.sqrt(cdx * cdx + cdy * cdy + cdz * cdz) || 0.0001;
+      var corr = ((dist - c.rest) / dist) * c.stiff;
+      var ccx = cdx * corr * 0.5, ccy = cdy * corr * 0.5, ccz = cdz * corr * 0.5;
+      var idx1 = c.r1 * (segX + 1) + c.c1, idx2 = c.r2 * (segX + 1) + c.c2;
+      var g1 = grabbed[idx1], g2 = grabbed[idx2];
+      if (!p1.pinned && !g1 && !p2.pinned && !g2) {
+        p1.pos.x += ccx; p1.pos.y += ccy; p1.pos.z += ccz;
+        p2.pos.x -= ccx; p2.pos.y -= ccy; p2.pos.z -= ccz;
+      } else if (!p1.pinned && !g1 && (p2.pinned || g2)) {
+        p1.pos.x += ccx * 2; p1.pos.y += ccy * 2; p1.pos.z += ccz * 2;
+      } else if ((p1.pinned || g1) && !p2.pinned && !g2) {
+        p2.pos.x -= ccx * 2; p2.pos.y -= ccy * 2; p2.pos.z -= ccz * 2;
+      }
+    }
+  }
+  if (this.grabTarget) {
+    var tx = this.grabTarget.x, ty = this.grabTarget.y, tz = this.grabTarget.z, springK = 0.025;
+    for (var key in grabbed) {
+      if (!grabbed.hasOwnProperty(key)) continue;
+      var idx = parseInt(key), row = Math.floor(idx / (segX + 1)), col = idx % (segX + 1);
+      var p = this.particles[row][col];
+      var mx = (tx - p.pos.x) * springK;
+      var my = (ty - p.pos.y) * springK;
+      var mz = (tz - p.pos.z) * springK + 0.03;
+      var mag = Math.sqrt(mx*mx + my*my + mz*mz);
+      if (mag > 0.10) { mx *= 0.10/mag; my *= 0.10/mag; mz *= 0.10/mag; }
+      p.pos.x += mx; p.pos.y += my; p.pos.z += mz;
+      p.prev.x += (p.pos.x - p.prev.x) * 0.10;
+      p.prev.y += (p.pos.y - p.prev.y) * 0.10;
+      p.prev.z += (p.pos.z - p.prev.z) * 0.10;
+    }
+  }
+  for (var row = 0; row <= segY; row++)
+    for (var col = 0; col <= segX; col++) {
+      var p = this.particles[row][col];
+      if (p.pos.z < 0) { p.pos.z = 0; p.prev.z = Math.max(p.prev.z, 0); }
+    }
+};
+// Grip: pull particles toward hand position + peel cloth open
+ClothSimulation.prototype.push = function(worldPos, forceDir, invMatrix, radius) {
+  var local = worldPos.clone().applyMatrix4(invMatrix);
+  var r = radius || this.width / this.segX * 2;
+  var gripK = 0.90, liftK = 0.65;
+  for (var row = 0; row <= this.segY; row++) {
+    for (var col = 0; col <= this.segX; col++) {
+      var p = this.particles[row][col]; if (p.pinned) continue;
+      var dx = local.x - p.pos.x, dy = local.y - p.pos.y, dz = local.z - p.pos.z;
+      var dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (dist < r) {
+        var falloff = 1 - dist / r;
+        p.pos.x += dx * gripK * falloff;
+        p.pos.y += dy * gripK * falloff;
+        p.pos.z += liftK * falloff;
+      }
+    }
+  }
+};
+ClothSimulation.prototype.grab = function(worldPos, invMatrix, radius) {
+  var local = worldPos.clone().applyMatrix4(invMatrix);
+  this.releaseAll();
+  var r = radius || this.width / this.segX * 2.5;
+  // Set grabTarget to average position of grabbed particles (not hand) → no jump
+  var sumX = 0, sumY = 0, sumZ = 0, count = 0;
+  for (var row = 0; row <= this.segY; row++)
+    for (var col = 0; col <= this.segX; col++) {
+      var p = this.particles[row][col]; if (p.pinned) continue;
+      var dx = p.pos.x - local.x, dy = p.pos.y - local.y, dz = p.pos.z - local.z;
+      if (Math.sqrt(dx * dx + dy * dy + dz * dz) < r) {
+        this.grabbedIndices[row * (this.segX + 1) + col] = true;
+        sumX += p.pos.x; sumY += p.pos.y; sumZ += p.pos.z; count++;
+      }
+    }
+  this.grabTarget = new THREE.Vector3(count > 0 ? sumX/count : local.x, count > 0 ? sumY/count : local.y, count > 0 ? sumZ/count : local.z);
+};
+ClothSimulation.prototype.moveGrab = function(worldPos, invMatrix) {
+  if (Object.keys(this.grabbedIndices).length === 0) return;
+  var local = worldPos.clone().applyMatrix4(invMatrix);
+  // Smooth grabTarget toward hand (40% toward hand, 60% stays) → no sudden movement
+  this.grabTarget.x += (local.x - this.grabTarget.x) * 0.4;
+  this.grabTarget.y += (local.y - this.grabTarget.y) * 0.4;
+  this.grabTarget.z += (local.z - this.grabTarget.z) * 0.4;
+};
+ClothSimulation.prototype.releaseAll = function() {
+  // On release: kill velocity of grabbed particles to prevent snap-back
+  for (var key in this.grabbedIndices) {
+    if (!this.grabbedIndices.hasOwnProperty(key)) continue;
+    var idx = parseInt(key), row = Math.floor(idx / (this.segX + 1)), col = idx % (this.segX + 1);
+    var p = this.particles[row][col];
+    p.prev.set(p.pos.x, p.pos.y, p.pos.z); // zero velocity
+  }
+  this.grabbedIndices = {}; this.grabTarget = null;
+};
+ClothSimulation.prototype.isGrabbing = function() { return Object.keys(this.grabbedIndices).length > 0; };
+ClothSimulation.prototype.getVertexData = function() {
+  var count = (this.segX + 1) * (this.segY + 1), arr = new Float32Array(count * 3), i = 0;
+  for (var row = 0; row <= this.segY; row++)
+    for (var col = 0; col <= this.segX; col++) {
+      var p = this.particles[row][col]; arr[i++] = p.pos.x; arr[i++] = p.pos.y; arr[i++] = p.pos.z;
+    }
+  return arr;
+};
+
+// ── Create one cloth unit (mesh + cat + physics) ──
+function createClothUnit(scene, clothW, clothH, centerX, centerY, bgW, bgH, animalTex, fbTex, hasCamera, index) {
+  var segX = 28, segY = 24;
+
+  var clothTex;
+  if (hasCamera) {
+    clothTex = new THREE.VideoTexture(video);
+    clothTex.colorSpace = THREE.SRGBColorSpace; clothTex.minFilter = THREE.LinearFilter; clothTex.magFilter = THREE.LinearFilter;
+  } else {
+    clothTex = fbTex.clone();
+  }
+  // UV match with texture flip (repeat.x = - for mirror)
+  clothTex.repeat.set(-clothW / bgW, clothH / bgH);
+  clothTex.offset.set(
+    (bgW / 2 - centerX + clothW / 2) / bgW,
+    (centerY + bgH / 2 - clothH / 2) / bgH
+  );
+  clothTex.wrapS = THREE.RepeatWrapping; clothTex.wrapT = THREE.ClampToEdgeWrapping;
+
+  var catGeo = new THREE.PlaneGeometry(clothW * 0.88, clothH * 0.88);
+  var catMat = new THREE.MeshBasicMaterial({ map: animalTex, depthTest: true, depthWrite: true });
+  var catPlane = new THREE.Mesh(catGeo, catMat);
+  catPlane.position.set(centerX, centerY, -0.06);
+  catPlane.renderOrder = 1 + index * 3;
+  scene.add(catPlane);
+
+  var clothGeo = new THREE.PlaneGeometry(clothW, clothH, segX, segY);
+  var clothMat = new THREE.MeshBasicMaterial({ map: clothTex, depthTest: true, depthWrite: true, side: THREE.DoubleSide });
+  var clothMesh = new THREE.Mesh(clothGeo, clothMat);
+  clothMesh.position.set(centerX, centerY, 0.06);
+  clothMesh.renderOrder = 2 + index * 3;
+  scene.add(clothMesh);
+
+  var sim = new ClothSimulation(clothW, clothH, segX, segY);
+  var posAttr = clothGeo.getAttribute('position');
+  posAttr.array.set(sim.getVertexData()); posAttr.needsUpdate = true;
+
+  return { mesh: clothMesh, sim: sim, posAttr: posAttr, clothTex: clothTex, centerX: centerX, centerY: centerY };
+}
+
+// ── Build scene ──
+function buildScene(hasCamera, animalTexes) {
+  var renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  document.body.appendChild(renderer.domElement);
+
+  var scene = new THREE.Scene();
+  var cam = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 50);
+  cam.position.set(0, 0.15, 5); cam.lookAt(0, -0.3, 0);
+
+  var vFov = cam.fov * Math.PI / 180;
+  var viewH = 2 * Math.tan(vFov / 2) * cam.position.z;
+  var viewW = viewH * cam.aspect;
+  var bgW = viewW * 1.05, bgH = viewH * 1.05;
+
+  var clothW = viewW * 0.23, clothH = viewH * 0.29;
+  var positions = [
+    { cx: -viewW * 0.26, cy: viewH * 0.16 },
+    { cx:  viewW * 0.26, cy: viewH * 0.16 },
+    { cx: -viewW * 0.26, cy: -viewH * 0.24 },
+    { cx:  viewW * 0.26, cy: -viewH * 0.24 }
+  ];
+
+  var fbTex = makeFallbackTex();
+  var bgTex;
+  if (hasCamera) {
+    bgTex = new THREE.VideoTexture(video);
+    bgTex.colorSpace = THREE.SRGBColorSpace; bgTex.minFilter = THREE.LinearFilter; bgTex.magFilter = THREE.LinearFilter;
+    // Mirror flip at texture level
+    bgTex.wrapS = THREE.RepeatWrapping; bgTex.repeat.x = -1; bgTex.offset.x = 1;
+  } else { bgTex = fbTex; }
+
+  // Fallback animal emoji textures
+  var emojis = ['🐱','🐶','🐰','🐼'];
+  var colors = ['#FFD6A5','#FFADC5','#BDE0FE','#CAFFBF'];
+  for (var i = 0; i < 4; i++) {
+    if (!animalTexes[i]) {
+      var cc = document.createElement('canvas'); cc.width = 256; cc.height = 256;
+      var cctx = cc.getContext('2d');
+      cctx.fillStyle = colors[i]; cctx.fillRect(0, 0, 256, 256);
+      cctx.fillStyle = '#fff'; cctx.font = 'bold 60px sans-serif'; cctx.textAlign = 'center';
+      cctx.fillText(emojis[i], 128, 160);
+      animalTexes[i] = new THREE.CanvasTexture(cc);
+      animalTexes[i].colorSpace = THREE.SRGBColorSpace;
+      animalTexes[i].minFilter = THREE.LinearFilter; animalTexes[i].magFilter = THREE.LinearFilter;
+    }
+  }
+
+  var bgGeo = new THREE.PlaneGeometry(bgW, bgH);
+  var bgMat = new THREE.MeshBasicMaterial({ map: bgTex, depthTest: true, depthWrite: true });
+  var bgPlane = new THREE.Mesh(bgGeo, bgMat);
+  bgPlane.position.z = -0.12; bgPlane.renderOrder = 0;
+  scene.add(bgPlane);
+
+  var units = [];
+  for (var i = 0; i < 4; i++) {
+    var p = positions[i];
+    units.push(createClothUnit(scene, clothW, clothH, p.cx, p.cy, bgW, bgH, animalTexes[i], fbTex, hasCamera, i));
+  }
+
+  // Mouse
+  var mouseDown = false, activeUnit = null;
+  var raycaster = new THREE.Raycaster(), mouseNDC = new THREE.Vector2();
+  var clothPlaneObj = new THREE.Plane(new THREE.Vector3(0, 0, 1), -0.06);
+
+  function screenToWorld(cx, cy) {
+    mouseNDC.x = (cx / window.innerWidth) * 2 - 1;
+    mouseNDC.y = -(cy / window.innerHeight) * 2 + 1;
+    raycaster.setFromCamera(mouseNDC, cam);
+    var t = new THREE.Vector3(); raycaster.ray.intersectPlane(clothPlaneObj, t); return t;
+  }
+  function findNearestUnit(wp) {
+    var best = null, bestDist = Infinity;
+    for (var i = 0; i < units.length; i++) {
+      var u = units[i];
+      var d = Math.sqrt((wp.x - u.centerX) ** 2 + (wp.y - u.centerY) ** 2);
+      if (d < clothW && d < bestDist) { bestDist = d; best = u; }
+    }
+    return best;
+  }
+
+  renderer.domElement.addEventListener('pointerdown', function(e) {
+    mouseDown = true;
+    var wp = screenToWorld(e.clientX, e.clientY);
+    if (wp) {
+      activeUnit = findNearestUnit(wp);
+      if (activeUnit) activeUnit.sim.grab(wp, activeUnit.mesh.matrixWorld.clone().invert(), clothW / activeUnit.sim.segX * 1.5);
+    }
+  });
+  renderer.domElement.addEventListener('pointermove', function(e) {
+    if (mouseDown && activeUnit && activeUnit.sim.isGrabbing()) {
+      var wp = screenToWorld(e.clientX, e.clientY);
+      if (wp) activeUnit.sim.moveGrab(wp, activeUnit.mesh.matrixWorld.clone().invert());
+    }
+  });
+  window.addEventListener('pointerup', function() {
+    mouseDown = false;
+    if (activeUnit) { activeUnit.sim.releaseAll(); activeUnit = null; }
+  });
+
+  // Hand tracking
+  var handReady = false, handPinching = false, handDetected = false;
+  var handX = 0.5, handY = 0.5, pinchFrames = 0;
+  var handsInstance = null, frameCount = 0;
+  var handGrabUnit = null;  // which cloth unit the hand is currently grabbing
+
+  var handDot = document.createElement('div');
+  handDot.style.cssText = 'position:fixed;width:8px;height:8px;border-radius:50%;background:rgba(255,100,100,0.8);border:1px solid #fff;z-index:8;pointer-events:none;display:none;transform:translate(-50%,-50%);box-shadow:0 0 6px rgba(255,0,0,0.4);';
+  document.body.appendChild(handDot);
+  var pinchDot = document.createElement('div');
+  pinchDot.style.cssText = 'position:fixed;width:10px;height:10px;border-radius:50%;background:rgba(100,255,100,0.85);border:1px solid #fff;z-index:8;pointer-events:none;display:none;transform:translate(-50%,-50%);box-shadow:0 0 8px rgba(0,255,0,0.4);';
+  document.body.appendChild(pinchDot);
+
+  function setupHands(idx) {
+    if (idx >= HANDS_CDNS.length) { setStatus(statusEl.textContent + ' | 手势库加载失败'); return; }
+    if (typeof Hands !== 'undefined') { tryInitModel(HANDS_BASE_URLS[Math.max(0, idx - 1)], idx); return; }
+    setStatus(statusEl.textContent + ' | 加载手势库(' + (idx+1) + '/' + HANDS_CDNS.length + ')…');
+    loadScript(HANDS_CDNS[idx], 8000).then(function() {
+      if (typeof Hands === 'undefined') { setupHands(idx + 1); return; }
+      tryInitModel(HANDS_BASE_URLS[idx], idx);
+    }).catch(function() { setupHands(idx + 1); });
+  }
+  function tryInitModel(baseUrl, idx) {
+    setStatus(statusEl.textContent + ' | 手势模型加载中…');
+    try {
+      var h = new Hands({ locateFile: function(f) { return baseUrl + f; } });
+      h.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.3, selfieMode: true });
+      h.onResults(function(r) {
+        if (r.multiHandLandmarks && r.multiHandLandmarks.length > 0) {
+          handDetected = true;
+          var lm = r.multiHandLandmarks[0];
+          var dx = lm[4].x - lm[8].x, dy = lm[4].y - lm[8].y;
+          var pinchDist = Math.sqrt(dx * dx + dy * dy);
+          var rawX = (lm[4].x + lm[8].x) / 2, rawY = (lm[4].y + lm[8].y) / 2;
+          handX = handX * 0.7 + rawX * 0.3; handY = handY * 0.7 + rawY * 0.3;
+          handDot.style.display = 'block';
+          handDot.style.left = (handX * window.innerWidth) + 'px';
+          handDot.style.top = (handY * window.innerHeight) + 'px';
+          if (pinchDist < 0.07) {
+            pinchFrames++;
+            if (pinchFrames >= 3) handPinching = true;
+            pinchDot.style.display = 'block';
+            pinchDot.style.left = (handX * window.innerWidth) + 'px';
+            pinchDot.style.top = (handY * window.innerHeight) + 'px';
+          } else { pinchFrames = 0; handPinching = false; pinchDot.style.display = 'none'; }
+        } else { handDetected = false; handPinching = false; handDot.style.display = 'none'; pinchDot.style.display = 'none'; }
+      });
+      h.initialize().then(function() { handReady = true; handsInstance = h; setStatus(statusEl.textContent + ' | 手势就绪 ✓'); })
+        .catch(function(e) { console.warn('Hands init:', e); setupHands(idx + 1); });
+    } catch (e) { console.warn('Hands create:', e); setupHands(idx + 1); }
+  }
+  setTimeout(function() { setupHands(0); }, 800);
+
+  // Animation loop
+  var lastTime = performance.now();
+  function animate(now) {
+    requestAnimationFrame(animate);
+    var dt = (now - lastTime) / 1000; lastTime = now;
+    if (dt <= 0) dt = 0.016; if (dt > 0.1) dt = 0.1; frameCount++;
+
+    if (hasCamera && video.readyState >= video.HAVE_CURRENT_DATA) {
+      bgTex.needsUpdate = true;
+      for (var i = 0; i < 4; i++) units[i].clothTex.needsUpdate = true;
+    }
+    if (handReady && handsInstance) { try { handsInstance.send({ image: video }); } catch (_) {} }
+
+    // ── Hand grip: same grab/moveGrab as mouse (before physics) ──
+    if (handPinching) {
+      var wx = (handX - 0.5) * viewW, wy = (0.5 - handY) * viewH;
+      var hw = new THREE.Vector3(wx, wy, 0.06);
+      if (handGrabUnit) {
+        handGrabUnit.sim.moveGrab(hw, handGrabUnit.mesh.matrixWorld.clone().invert());
+      } else {
+        handGrabUnit = findNearestUnit(hw);
+        if (handGrabUnit) {
+          handGrabUnit.sim.grab(hw, handGrabUnit.mesh.matrixWorld.clone().invert(), clothW / handGrabUnit.sim.segX * 1.5);
+        }
+      }
+    } else {
+      if (handGrabUnit) { handGrabUnit.sim.releaseAll(); handGrabUnit = null; }
+    }
+
+    // ── Physics ──
+    var subDt = dt / 2;
+    for (var s = 0; s < 2; s++)
+      for (var i = 0; i < 4; i++) units[i].sim.update(subDt);
+
+    if (!handDetected) { handDot.style.display = 'none'; pinchDot.style.display = 'none'; }
+
+    for (var i = 0; i < 4; i++) {
+      units[i].posAttr.array.set(units[i].sim.getVertexData());
+      units[i].posAttr.needsUpdate = true;
+    }
+
+    renderer.render(scene, cam);
+  }
+
+  window.addEventListener('resize', function() {
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    cam.aspect = window.innerWidth / window.innerHeight; cam.updateProjectionMatrix();
+  });
+
+  loadingEl.classList.add('done'); hintEl.style.opacity = '0.7';
+  setStatus(statusEl.textContent + ' | 就绪');
+  requestAnimationFrame(animate);
+}
+
+// ── Bootstrap ──
+function tryLoadThree(idx, onDone) {
+  if (idx >= THREE_CDNS.length) {
+    setStatus('Three.js 加载失败！请检查网络后刷新');
+    loadingEl.querySelector('.msg').style.color = '#ff6b6b';
+    loadingEl.querySelector('.spinner').style.display = 'none'; return;
+  }
+  setStatus('加载 Three.js (' + (idx + 1) + '/' + THREE_CDNS.length + ')…');
+  loadScript(THREE_CDNS[idx], 6000).then(function() {
+    if (typeof THREE !== 'undefined') { setStatus('Three.js 已加载 ✓'); onDone(); }
+    else tryLoadThree(idx + 1, onDone);
+  }).catch(function() { tryLoadThree(idx + 1, onDone); });
+}
+loadScript(HANDS_CDNS[0], 5000).catch(function() { loadScript(HANDS_CDNS[1], 5000).catch(function() {}); });
+
+setTimeout(function() {
+  if (typeof THREE !== 'undefined' && !loadingEl.classList.contains('done')) {
+    setStatus('超时，强制启动…');
+    initCamera().then(function(hasCam) { loadAnimalImages().then(function(texes) { buildScene(hasCam, texes); }); });
+  }
+}, 12000);
+
+tryLoadThree(0, function() {
+  setStatus('请求摄像头 & 加载小动物照片…');
+  Promise.all([initCamera(), loadAnimalImages()]).then(function(results) {
+    var hasCam = results[0], texes = results[1];
+    setStatus(hasCam ? '摄像头就绪' : '演示模式');
+    buildScene(hasCam, texes);
+  });
+});
+</script>
+</body>
+</html>
